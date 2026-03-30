@@ -1,6 +1,6 @@
 CC=			gcc
 #CC=			clang --analyze
-CFLAGS=		-g -Wall -Wno-unused-function -O3
+CFLAGS=		-g -Wall -Wno-unused-function -O3 -fno-math-errno -fno-trapping-math
 WRAP_MALLOC=-DUSE_MALLOC_WRAPPERS
 AR=			ar
 DFLAGS=		-DHAVE_PTHREAD $(WRAP_MALLOC)
@@ -43,8 +43,27 @@ bwamem-lite:libbwa.a example.o
 libbwa.a:$(LOBJS)
 		$(AR) -csru $@ $(LOBJS)
 
-clean:
+pgo:
 		rm -f gmon.out *.o a.out $(PROG) *~ *.a
+		$(MAKE) CFLAGS="$(CFLAGS) -fprofile-instr-generate"
+		LLVM_PROFILE_FILE=default.profraw ./bwa mem -t 1 bench/ref.fa bench/reads_1.fq bench/reads_2.fq > /dev/null 2>/dev/null
+		xcrun llvm-profdata merge -output=default.profdata default.profraw
+		rm -f *.o a.out $(PROG) *~ *.a
+		$(MAKE) CFLAGS="$(CFLAGS) -fprofile-instr-use=default.profdata"
+		rm -f default.profraw default.profdata
+		@echo "PGO build complete"
+
+gpu:
+		@echo "Building BWA with Metal GPU support (runtime shader compilation)..."
+		$(MAKE) DFLAGS="$(DFLAGS) -DHAVE_METAL" LIBS="$(LIBS) -framework Metal -framework Foundation" \
+			LOBJS="$(LOBJS) ksw_metal.o"
+		@echo "GPU build complete. Shader compiled at runtime from ksw_extend2.metal"
+
+ksw_metal.o: ksw_metal.m ksw_metal.h
+		clang -c -O3 -fobjc-arc $(DFLAGS) ksw_metal.m -o ksw_metal.o
+
+clean:
+		rm -f gmon.out *.o a.out $(PROG) *~ *.a default.profraw default.profdata *.air *.metallib
 
 depend:
 	( LC_ALL=C ; export LC_ALL; makedepend -Y -- $(CFLAGS) $(DFLAGS) $(CPPFLAGS) -- *.c )

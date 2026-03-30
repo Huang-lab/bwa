@@ -33,10 +33,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// requirement: (OCC_INTERVAL%16 == 0); please DO NOT change this line because some part of the code assume OCC_INTERVAL=0x80
+// Disk format (128-position interval, used by bwa index / bwt_bwtupdate_core)
 #define OCC_INTV_SHIFT 7
 #define OCC_INTERVAL   (1LL<<OCC_INTV_SHIFT)
 #define OCC_INTV_MASK  (OCC_INTERVAL - 1)
+// Runtime one-hot format (64-position interval with popcount, converted at load time)
+#define OCC_ONEHOT_SHIFT 6
 
 #ifndef BWA_UBYTE
 #define BWA_UBYTE
@@ -57,6 +59,7 @@ typedef struct {
 	int sa_intv;
 	bwtint_t n_sa;
 	bwtint_t *sa;
+	int is_onehot; // 1 if converted to one-hot format at runtime
 } bwt_t;
 
 typedef struct {
@@ -65,19 +68,25 @@ typedef struct {
 
 typedef struct { size_t n, m; bwtintv_t *a; } bwtintv_v;
 
-/* For general OCC_INTERVAL, the following is correct:
-#define bwt_bwt(b, k) ((b)->bwt[(k)/OCC_INTERVAL * (OCC_INTERVAL/(sizeof(uint32_t)*8/2) + sizeof(bwtint_t)/4*4) + sizeof(bwtint_t)/4*4 + (k)%OCC_INTERVAL/16])
-#define bwt_occ_intv(b, k) ((b)->bwt + (k)/OCC_INTERVAL * (OCC_INTERVAL/(sizeof(uint32_t)*8/2) + sizeof(bwtint_t)/4*4)
-*/
+// Dual-mode: supports both old (128-pos, 2-bit packed) and one-hot (64-pos, bitvectors)
+static inline uint32_t *bwt_occ_intv(const bwt_t *bwt, bwtint_t k) {
+	return bwt->is_onehot
+		? bwt->bwt + ((k >> OCC_ONEHOT_SHIFT) << 4)   // one-hot: 64-pos blocks
+		: bwt->bwt + ((k >> OCC_INTV_SHIFT) << 4);     // old: 128-pos blocks
+}
 
-// The following two lines are ONLY correct when OCC_INTERVAL==0x80
-#define bwt_bwt(b, k) ((b)->bwt[((k)>>7<<4) + sizeof(bwtint_t) + (((k)&0x7f)>>4)])
-#define bwt_occ_intv(b, k) ((b)->bwt + ((k)>>7<<4))
+// Old format helpers (for bwa index path)
+#define bwt_bwt_old(b, k) ((b)->bwt[((k)>>7<<4) + sizeof(bwtint_t) + (((k)&0x7f)>>4)])
 
-/* retrieve a character from the $-removed BWT string. Note that
- * bwt_t::bwt is not exactly the BWT string and therefore this macro is
- * called bwt_B0 instead of bwt_B */
-#define bwt_B0(b, k) (bwt_bwt(b, k)>>((~(k)&0xf)<<1)&3)
+static inline int bwt_B0(const bwt_t *bwt, bwtint_t k) {
+	if (bwt->is_onehot) {
+		const uint64_t *oh = (const uint64_t*)bwt_occ_intv(bwt, k) + 4;
+		int bit = k & 63;
+		return (int)(((oh[1] | oh[3]) >> bit) & 1) | ((int)(((oh[2] | oh[3]) >> bit) & 1) << 1);
+	} else {
+		return (bwt_bwt_old(bwt, k) >> ((~(k) & 0xf) << 1)) & 3;
+	}
+}
 
 #define bwt_set_intv(bwt, c, ik) ((ik).x[0] = (bwt)->L2[(int)(c)]+1, (ik).x[2] = (bwt)->L2[(int)(c)+1]-(bwt)->L2[(int)(c)], (ik).x[1] = (bwt)->L2[3-(c)]+1, (ik).info = 0)
 

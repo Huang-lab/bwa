@@ -59,6 +59,8 @@ static inline bwtint_t bwt_invPsi(const bwt_t *bwt, bwtint_t k) // compute inver
 }
 
 // bwt->bwt and bwt->occ must be precalculated
+void bwt_convert_to_onehot(bwt_t *bwt); // forward declaration
+
 void bwt_cal_sa(bwt_t *bwt, int intv)
 {
 	bwtint_t isa, sa, i; // S(isa) = sa
@@ -67,6 +69,7 @@ void bwt_cal_sa(bwt_t *bwt, int intv)
 	kv_roundup32(intv_round);
 	xassert(intv_round == intv, "SA sample interval is not a power of 2.");
 	xassert(bwt->bwt, "bwt_t::bwt is not initialized.");
+	if (!bwt->is_onehot) bwt_convert_to_onehot(bwt); // convert before SA computation
 
 	if (bwt->sa) free(bwt->sa);
 	bwt->sa_intv = intv;
@@ -86,136 +89,108 @@ void bwt_cal_sa(bwt_t *bwt, int intv)
 bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 {
 	bwtint_t sa = 0, mask = bwt->sa_intv - 1;
+	// prefetch the SA entry — k will change but the final SA block may be nearby
+	__builtin_prefetch(&bwt->sa[k / bwt->sa_intv], 0, 0);
 	while (k & mask) {
 		++sa;
 		k = bwt_invPsi(bwt, k);
 	}
-	/* without setting bwt->sa[0] = -1, the following line should be
-	   changed to (sa + bwt->sa[k/bwt->sa_intv]) % (bwt->seq_len + 1) */
 	return sa + bwt->sa[k/bwt->sa_intv];
 }
 
+// Old-format occurrence counting (used during bwa index before one-hot conversion)
 static inline int __occ_aux(uint64_t y, int c)
 {
-	// reduce nucleotide counting to bits counting
 	y = ((c&2)? y : ~y) >> 1 & ((c&1)? y : ~y) & 0x5555555555555555ull;
-	// count the number of 1s in y
 	y = (y & 0x3333333333333333ull) + (y >> 2 & 0x3333333333333333ull);
 	return ((y + (y >> 4)) & 0xf0f0f0f0f0f0f0full) * 0x101010101010101ull >> 56;
 }
 
-bwtint_t bwt_occ(const bwt_t *bwt, bwtint_t k, ubyte_t c)
+static bwtint_t bwt_occ_old(const bwt_t *bwt, bwtint_t k, ubyte_t c)
 {
 	bwtint_t n;
 	uint32_t *p, *end;
-
-	if (k == bwt->seq_len) return bwt->L2[c+1] - bwt->L2[c];
-	if (k == (bwtint_t)(-1)) return 0;
-	k -= (k >= bwt->primary); // because $ is not in bwt
-
-	// retrieve Occ at k/OCC_INTERVAL
+	k -= (k >= bwt->primary);
 	n = ((bwtint_t*)(p = bwt_occ_intv(bwt, k)))[c];
-	p += sizeof(bwtint_t); // jump to the start of the first BWT cell
-
-	// calculate Occ up to the last k/32
+	p += sizeof(bwtint_t);
 	end = p + (((k>>5) - ((k&~OCC_INTV_MASK)>>5))<<1);
 	for (; p < end; p += 2) n += __occ_aux((uint64_t)p[0]<<32 | p[1], c);
-
-	// calculate Occ
 	n += __occ_aux(((uint64_t)p[0]<<32 | p[1]) & ~((1ull<<((~k&31)<<1)) - 1), c);
-	if (c == 0) n -= ~k&31; // corrected for the masked bits
-
+	if (c == 0) n -= ~k&31;
 	return n;
 }
 
-// an analogy to bwt_occ() but more efficient, requiring k <= l
+// One-hot occurrence counting — single popcount per base
+static inline uint64_t occ_mask(bwtint_t k)
+{
+	int y = k & 63;
+	return ~0ULL >> (63 ^ y);
+}
+
+bwtint_t bwt_occ(const bwt_t *bwt, bwtint_t k, ubyte_t c)
+{
+	if (k == bwt->seq_len) return bwt->L2[c+1] - bwt->L2[c];
+	if (k == (bwtint_t)(-1)) return 0;
+	if (!bwt->is_onehot) return bwt_occ_old(bwt, k, c);
+	k -= (k >= bwt->primary);
+	const uint64_t *p = (const uint64_t*)bwt_occ_intv(bwt, k);
+	return p[c] + __builtin_popcountll(p[4 + c] & occ_mask(k));
+}
+
 void bwt_2occ(const bwt_t *bwt, bwtint_t k, bwtint_t l, ubyte_t c, bwtint_t *ok, bwtint_t *ol)
 {
 	bwtint_t _k, _l;
 	_k = (k >= bwt->primary)? k-1 : k;
 	_l = (l >= bwt->primary)? l-1 : l;
-	if (_l/OCC_INTERVAL != _k/OCC_INTERVAL || k == (bwtint_t)(-1) || l == (bwtint_t)(-1)) {
+	if ((bwt->is_onehot ? (_l>>OCC_ONEHOT_SHIFT != _k>>OCC_ONEHOT_SHIFT) : (_l>>OCC_INTV_SHIFT != _k>>OCC_INTV_SHIFT)) || k == (bwtint_t)(-1) || l == (bwtint_t)(-1)) {
 		*ok = bwt_occ(bwt, k, c);
 		*ol = bwt_occ(bwt, l, c);
 	} else {
-		bwtint_t m, n, i, j;
-		uint32_t *p;
 		if (k >= bwt->primary) --k;
 		if (l >= bwt->primary) --l;
-		n = ((bwtint_t*)(p = bwt_occ_intv(bwt, k)))[c];
-		p += sizeof(bwtint_t);
-		// calculate *ok
-		j = k >> 5 << 5;
-		for (i = k/OCC_INTERVAL*OCC_INTERVAL; i < j; i += 32, p += 2)
-			n += __occ_aux((uint64_t)p[0]<<32 | p[1], c);
-		m = n;
-		n += __occ_aux(((uint64_t)p[0]<<32 | p[1]) & ~((1ull<<((~k&31)<<1)) - 1), c);
-		if (c == 0) n -= ~k&31; // corrected for the masked bits
-		*ok = n;
-		// calculate *ol
-		j = l >> 5 << 5;
-		for (; i < j; i += 32, p += 2)
-			m += __occ_aux((uint64_t)p[0]<<32 | p[1], c);
-		m += __occ_aux(((uint64_t)p[0]<<32 | p[1]) & ~((1ull<<((~l&31)<<1)) - 1), c);
-		if (c == 0) m -= ~l&31; // corrected for the masked bits
-		*ol = m;
+		const uint64_t *p = (const uint64_t*)bwt_occ_intv(bwt, k);
+		uint64_t bits = p[4 + c];
+		*ok = p[c] + __builtin_popcountll(bits & occ_mask(k));
+		*ol = p[c] + __builtin_popcountll(bits & occ_mask(l));
 	}
 }
 
-#define __occ_aux4(bwt, b)											\
-	((bwt)->cnt_table[(b)&0xff] + (bwt)->cnt_table[(b)>>8&0xff]		\
-	 + (bwt)->cnt_table[(b)>>16&0xff] + (bwt)->cnt_table[(b)>>24])
-
 void bwt_occ4(const bwt_t *bwt, bwtint_t k, bwtint_t cnt[4])
 {
-	bwtint_t x;
-	uint32_t *p, tmp, *end;
 	if (k == (bwtint_t)(-1)) {
 		memset(cnt, 0, 4 * sizeof(bwtint_t));
 		return;
 	}
-	k -= (k >= bwt->primary); // because $ is not in bwt
-	p = bwt_occ_intv(bwt, k);
-	memcpy(cnt, p, 4 * sizeof(bwtint_t));
-	p += sizeof(bwtint_t); // sizeof(bwtint_t) = 4*(sizeof(bwtint_t)/sizeof(uint32_t))
-	end = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4)); // this is the end point of the following loop
-	for (x = 0; p < end; ++p) x += __occ_aux4(bwt, *p);
-	tmp = *p & ~((1U<<((~k&15)<<1)) - 1);
-	x += __occ_aux4(bwt, tmp) - (~k&15);
-	cnt[0] += x&0xff; cnt[1] += x>>8&0xff; cnt[2] += x>>16&0xff; cnt[3] += x>>24;
+	k -= (k >= bwt->primary);
+	const uint64_t *p = (const uint64_t*)bwt_occ_intv(bwt, k);
+	uint64_t mask = occ_mask(k);
+	cnt[0] = p[0] + __builtin_popcountll(p[4] & mask);
+	cnt[1] = p[1] + __builtin_popcountll(p[5] & mask);
+	cnt[2] = p[2] + __builtin_popcountll(p[6] & mask);
+	cnt[3] = p[3] + __builtin_popcountll(p[7] & mask);
 }
 
-// an analogy to bwt_occ4() but more efficient, requiring k <= l
 void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4])
 {
 	bwtint_t _k, _l;
 	_k = k - (k >= bwt->primary);
 	_l = l - (l >= bwt->primary);
-	if (_l>>OCC_INTV_SHIFT != _k>>OCC_INTV_SHIFT || k == (bwtint_t)(-1) || l == (bwtint_t)(-1)) {
+	if ((bwt->is_onehot ? (_l>>OCC_ONEHOT_SHIFT != _k>>OCC_ONEHOT_SHIFT) : (_l>>OCC_INTV_SHIFT != _k>>OCC_INTV_SHIFT)) || k == (bwtint_t)(-1) || l == (bwtint_t)(-1)) {
 		bwt_occ4(bwt, k, cntk);
 		bwt_occ4(bwt, l, cntl);
 	} else {
-		bwtint_t x, y;
-		uint32_t *p, tmp, *endk, *endl;
-		k -= (k >= bwt->primary); // because $ is not in bwt
+		k -= (k >= bwt->primary);
 		l -= (l >= bwt->primary);
-		p = bwt_occ_intv(bwt, k);
-		memcpy(cntk, p, 4 * sizeof(bwtint_t));
-		p += sizeof(bwtint_t); // sizeof(bwtint_t) = 4*(sizeof(bwtint_t)/sizeof(uint32_t))
-		// prepare cntk[]
-		endk = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4));
-		endl = p + ((l>>4) - ((l&~OCC_INTV_MASK)>>4));
-		for (x = 0; p < endk; ++p) x += __occ_aux4(bwt, *p);
-		y = x;
-		tmp = *p & ~((1U<<((~k&15)<<1)) - 1);
-		x += __occ_aux4(bwt, tmp) - (~k&15);
-		// calculate cntl[] and finalize cntk[]
-		for (; p < endl; ++p) y += __occ_aux4(bwt, *p);
-		tmp = *p & ~((1U<<((~l&15)<<1)) - 1);
-		y += __occ_aux4(bwt, tmp) - (~l&15);
-		memcpy(cntl, cntk, 4 * sizeof(bwtint_t));
-		cntk[0] += x&0xff; cntk[1] += x>>8&0xff; cntk[2] += x>>16&0xff; cntk[3] += x>>24;
-		cntl[0] += y&0xff; cntl[1] += y>>8&0xff; cntl[2] += y>>16&0xff; cntl[3] += y>>24;
+		const uint64_t *p = (const uint64_t*)bwt_occ_intv(bwt, k);
+		uint64_t mk = occ_mask(k), ml = occ_mask(l);
+		cntk[0] = p[0] + __builtin_popcountll(p[4] & mk);
+		cntk[1] = p[1] + __builtin_popcountll(p[5] & mk);
+		cntk[2] = p[2] + __builtin_popcountll(p[6] & mk);
+		cntk[3] = p[3] + __builtin_popcountll(p[7] & mk);
+		cntl[0] = p[0] + __builtin_popcountll(p[4] & ml);
+		cntl[1] = p[1] + __builtin_popcountll(p[5] & ml);
+		cntl[2] = p[2] + __builtin_popcountll(p[6] & ml);
+		cntl[3] = p[3] + __builtin_popcountll(p[7] & ml);
 	}
 }
 
@@ -285,6 +260,9 @@ static void bwt_reverse_intvs(bwtintv_v *p)
 		}
 	}
 }
+void bwt_extend_fwd(const bwt_t *restrict bwt, const bwtintv_t *restrict ik, bwtintv_t ok[restrict 4]);
+void bwt_extend_back(const bwt_t *restrict bwt, const bwtintv_t *restrict ik, bwtintv_t ok[restrict 4]);
+
 // NOTE: $max_intv is not currently used in BWA-MEM
 int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv, uint64_t max_intv, bwtintv_v *mem, bwtintv_v *tmpvec[2])
 {
@@ -307,7 +285,7 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 			break;
 		} else if (q[i] < 4) { // an A/C/G/T base
 			c = 3 - q[i]; // complement of q[i]
-			bwt_extend(bwt, &ik, ok, 0);
+			bwt_extend_fwd(bwt, &ik, ok);
 			if (ok[c].x[2] != ik.x[2]) { // change of the interval size
 				kv_push(bwtintv_t, *curr, ik);
 				if (ok[c].x[2] < min_intv) break; // the interval size is too small to be extended further
@@ -327,7 +305,7 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 		c = i < 0? -1 : q[i] < 4? q[i] : -1; // c==-1 if i<0 or q[i] is an ambiguous base
 		for (j = 0, curr->n = 0; j < prev->n; ++j) {
 			bwtintv_t *p = &prev->a[j];
-			if (c >= 0 && ik.x[2] >= max_intv) bwt_extend(bwt, p, ok, 1);
+			if (c >= 0 && ik.x[2] >= max_intv) bwt_extend_back(bwt, p, ok);
 			if (c < 0 || ik.x[2] < max_intv || ok[c].x[2] < min_intv) { // keep the hit if reaching the beginning or an ambiguous base or the intv is small enough
 				if (curr->n == 0) { // test curr->n>0 to make sure there are no longer matches
 					if (mem->n == 0 || i + 1 < mem->a[mem->n-1].info>>32) { // skip contained matches
@@ -366,7 +344,7 @@ int bwt_seed_strategy1(const bwt_t *bwt, int len, const uint8_t *q, int x, int m
 	for (i = x + 1; i < len; ++i) { // forward search
 		if (q[i] < 4) { // an A/C/G/T base
 			c = 3 - q[i]; // complement of q[i]
-			bwt_extend(bwt, &ik, ok, 0);
+			bwt_extend_fwd(bwt, &ik, ok);
 			if (ok[c].x[2] < max_intv && i - x >= min_len) {
 				*mem = ok[c];
 				mem->info = (uint64_t)x<<32 | (i + 1);
@@ -440,6 +418,79 @@ void bwt_restore_sa(const char *fn, bwt_t *bwt)
 	err_fclose(fp);
 }
 
+// Convert old interleaved BWT format (OCC_INTERVAL=128, 2-bit packed) to
+// one-hot format (OCC_INTERVAL=64, per-base bitvectors) at load time.
+// Old block layout: [4×u64 counts][8×u32 2-bit packed BWT data] = 64 bytes per 128 positions
+// New block layout: [4×u64 counts][4×u64 one-hot bitvectors] = 64 bytes per 64 positions
+void bwt_convert_to_onehot(bwt_t *bwt)
+{
+	bwtint_t i;
+	bwtint_t old_intv = 128; // the file was written with OCC_INTERVAL=128
+	bwtint_t n_occ_new = (bwt->seq_len + (1LL<<OCC_ONEHOT_SHIFT) - 1) / (1LL<<OCC_ONEHOT_SHIFT) + 1;
+	bwtint_t new_size = n_occ_new * 16; // 16 uint32_t per block
+	uint32_t *new_bwt = (uint32_t*)calloc(new_size, 4);
+
+	// First, extract the raw BWT string (2-bit packed, no interleaving)
+	// from the old interleaved format
+	bwtint_t n_raw_words = (bwt->seq_len + 15) / 16;
+	uint32_t *raw = (uint32_t*)calloc(n_raw_words, 4);
+	{
+		// Old block at position i*128: bwt->bwt[(i<<4)]
+		// Counts at offset 0..3 (as uint64_t[4] = uint32_t[0..7])
+		// BWT data at offset 8..15 (uint32_t[8..15], 8 words = 128 positions)
+		bwtint_t n_old_blocks = (bwt->seq_len + old_intv - 1) / old_intv;
+		bwtint_t raw_idx = 0;
+		for (i = 0; i < n_old_blocks; ++i) {
+			uint32_t *old_block = bwt->bwt + (i << 4);
+			// BWT data starts after 4 × uint64_t = 8 × uint32_t
+			uint32_t *bwt_data = old_block + 8;
+			int n_words = 8; // 128/16
+			bwtint_t remaining = bwt->seq_len - i * old_intv;
+			if (remaining < old_intv) n_words = (remaining + 15) / 16;
+			int j;
+			for (j = 0; j < n_words && raw_idx < n_raw_words; ++j)
+				raw[raw_idx++] = bwt_data[j];
+		}
+	}
+
+	// Now build the one-hot format from the raw BWT
+	{
+		bwtint_t c[4] = {0, 0, 0, 0};
+		bwtint_t block_idx = 0;
+		for (i = 0; i < bwt->seq_len; ) {
+			// Start of a new block
+			uint64_t *out = (uint64_t*)(new_bwt + (block_idx << 4));
+			// Store cumulative counts
+			out[0] = c[0]; out[1] = c[1]; out[2] = c[2]; out[3] = c[3];
+			// Build one-hot bitvectors for positions [i, i+64)
+			uint64_t oh[4] = {0, 0, 0, 0};
+			bwtint_t end = i + 64;
+			if (end > bwt->seq_len) end = bwt->seq_len;
+			bwtint_t j;
+			for (j = i; j < end; ++j) {
+				int base = (raw[j >> 4] >> ((~j & 15) << 1)) & 3;
+				oh[base] |= 1ULL << (j - i);
+				++c[base];
+			}
+			out[4] = oh[0]; out[5] = oh[1]; out[6] = oh[2]; out[7] = oh[3];
+			++block_idx;
+			i = end;
+		}
+		// Final block with just counts (boundary)
+		if (block_idx < n_occ_new) {
+			uint64_t *out = (uint64_t*)(new_bwt + (block_idx << 4));
+			out[0] = c[0]; out[1] = c[1]; out[2] = c[2]; out[3] = c[3];
+			out[4] = out[5] = out[6] = out[7] = 0;
+		}
+	}
+
+	free(raw);
+	free(bwt->bwt);
+	bwt->bwt = new_bwt;
+	bwt->bwt_size = new_size;
+	bwt->is_onehot = 1;
+}
+
 bwt_t *bwt_restore_bwt(const char *fn)
 {
 	bwt_t *bwt;
@@ -456,7 +507,7 @@ bwt_t *bwt_restore_bwt(const char *fn)
 	fread_fix(fp, bwt->bwt_size<<2, bwt->bwt);
 	bwt->seq_len = bwt->L2[4];
 	err_fclose(fp);
-	bwt_gen_cnt_table(bwt);
+	bwt_gen_cnt_table(bwt); // needed for old format; one-hot conversion deferred
 
 	return bwt;
 }
@@ -466,4 +517,36 @@ void bwt_destroy(bwt_t *bwt)
 	if (bwt == 0) return;
 	free(bwt->sa); free(bwt->bwt);
 	free(bwt);
+}
+
+// Specialized bwt_extend for backward search (is_back=1) — eliminates indexing overhead
+void bwt_extend_back(const bwt_t *restrict bwt, const bwtintv_t *restrict ik, bwtintv_t ok[restrict 4])
+{
+	bwtint_t tk[4], tl[4];
+	int i;
+	bwt_2occ4(bwt, ik->x[0] - 1, ik->x[0] - 1 + ik->x[2], tk, tl);
+	for (i = 0; i != 4; ++i) {
+		ok[i].x[0] = bwt->L2[i] + 1 + tk[i];
+		ok[i].x[2] = tl[i] - tk[i];
+	}
+	ok[3].x[1] = ik->x[1] + (ik->x[0] <= bwt->primary && ik->x[0] + ik->x[2] - 1 >= bwt->primary);
+	ok[2].x[1] = ok[3].x[1] + ok[3].x[2];
+	ok[1].x[1] = ok[2].x[1] + ok[2].x[2];
+	ok[0].x[1] = ok[1].x[1] + ok[1].x[2];
+}
+
+// Specialized bwt_extend for forward search (is_back=0)
+void bwt_extend_fwd(const bwt_t *restrict bwt, const bwtintv_t *restrict ik, bwtintv_t ok[restrict 4])
+{
+	bwtint_t tk[4], tl[4];
+	int i;
+	bwt_2occ4(bwt, ik->x[1] - 1, ik->x[1] - 1 + ik->x[2], tk, tl);
+	for (i = 0; i != 4; ++i) {
+		ok[i].x[1] = bwt->L2[i] + 1 + tk[i];
+		ok[i].x[2] = tl[i] - tk[i];
+	}
+	ok[3].x[0] = ik->x[0] + (ik->x[1] <= bwt->primary && ik->x[1] + ik->x[2] - 1 >= bwt->primary);
+	ok[2].x[0] = ok[3].x[0] + ok[3].x[2];
+	ok[1].x[0] = ok[2].x[0] + ok[2].x[2];
+	ok[0].x[0] = ok[1].x[0] + ok[1].x[2];
 }

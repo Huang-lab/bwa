@@ -1131,8 +1131,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
 	qb = ar->qb, qe = ar->qe;
 	rb = ar->rb, re = ar->re;
 	query = malloc(l_query);
-	for (i = 0; i < l_query; ++i) // convert to the nt4 encoding
-		query[i] = query_[i] < 5? query_[i] : nst_nt4_table[(int)query_[i]];
+	memcpy(query, query_, l_query); // query_ is already nt4-encoded from mem_align1_core
 	a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
 	if (ar->secondary >= 0) a.flag |= 0x100; // secondary alignment
 	tmp = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_del, opt->e_del);
@@ -1241,6 +1240,11 @@ void mem_process_seqs(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 	int i;
 
 	ctime = cputime(); rtime = realtime();
+	// Lazy one-hot conversion: convert BWT to popcount-friendly format on first batch
+	if (!bwt->is_onehot) {
+		extern void bwt_convert_to_onehot(bwt_t *bwt);
+		bwt_convert_to_onehot((bwt_t*)bwt);
+	}
 	global_bns = bns;
 	w.regs = malloc(n * sizeof(mem_alnreg_v));
 	w.opt = opt; w.bwt = bwt; w.bns = bns; w.pac = pac;
